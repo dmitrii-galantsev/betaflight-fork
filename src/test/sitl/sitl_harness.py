@@ -100,7 +100,15 @@ class SimClock:
                 # bounded wait so a stalled FDM feed cannot deadlock a scenario
                 if not self._cv.wait(timeout=5.0):
                     if self._t < target:
-                        return
+                        # Returning here would leave simulated time short of the target.
+                        # wait_for() derives its deadline from the same clock, so it would
+                        # spin forever and hang the whole suite. Fail the scenario instead:
+                        # run_scenario() catches TimeoutError and records it.
+                        raise TimeoutError(
+                            f"simulated clock stalled at t={self._t:.3f}s waiting for "
+                            f"t={target:.3f}s (FDM feed stopped advancing time)"
+                        )
+
     def deadline(self, seconds):
         return self.now() + seconds
 
