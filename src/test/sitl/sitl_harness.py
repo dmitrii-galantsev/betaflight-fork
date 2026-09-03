@@ -61,6 +61,60 @@ VERBOSE = False
 TELEMETRY_PORT = 9005  # ground-truth JSON fan-out for external visualisers, 0 disables
 
 
+# --- simulated clock -------------------------------------------------------
+# SITL derives its own time scale from the ratio of the harness's FDM packet timestamps to
+# wall clock (sitl.c: simRate = deltaSim / wallDelta) and divides every internal
+# sleep by it, so driving the sim clock faster than real time speeds the whole FC
+# up with no firmware change. Note SITL only updates that ratio while
+# deltaSim < 0.02, so the FDM step must stay strictly under 20ms.
+#
+# All scenario waits go through this clock, so they are expressed in simulated
+# seconds and scale automatically with --speed. The step is fixed rather than
+# measured, which also makes runs far more repeatable than wall-clock stepping.
+FDM_STEP_S = 0.01          # 100Hz, strictly under SITL's 20ms simRate gate
+SPEED = 1.0                # wall-clock divisor, set from --speed
+
+
+class SimClock:
+    """Virtual time, advanced by the FDM feed - the only thread that steps physics."""
+
+    def __init__(self):
+        self._t = 0.0
+        self._cv = threading.Condition()
+
+    def advance(self, dt):
+        with self._cv:
+            self._t += dt
+            self._cv.notify_all()
+
+    def now(self):
+        with self._cv:
+            return self._t
+
+    def sleep(self, seconds):
+        """Block until `seconds` of simulated time have passed."""
+        target = self.now() + seconds
+        with self._cv:
+            while self._t < target:
+                # bounded wait so a stalled FDM feed cannot deadlock a scenario
+                if not self._cv.wait(timeout=5.0):
+                    if self._t < target:
+                        return
+    def deadline(self, seconds):
+        return self.now() + seconds
+
+
+CLOCK = SimClock()
+
+
+def sim_now():
+    return CLOCK.now()
+
+
+def sim_sleep(seconds):
+    CLOCK.sleep(seconds)
+
+
 def log(msg):
     print(f"[harness] {msg}", flush=True)
 
@@ -79,7 +133,7 @@ class RcFeed(threading.Thread):
         self.channels = [RC_MID, RC_MID, RC_LOW, RC_MID] + [RC_LOW] * 12  # AERT + AUX
         self.streaming = True
         self.running = True
-        self.t0 = time.monotonic()
+        self.t0 = 0.0
 
     def set(self, index, value):
         self.channels[index] = value
@@ -87,9 +141,9 @@ class RcFeed(threading.Thread):
     def run(self):
         while self.running:
             if self.streaming:
-                pkt = struct.pack("<d16H", time.monotonic() - self.t0, *self.channels)
+                pkt = struct.pack("<d16H", CLOCK.now() - self.t0, *self.channels)
                 self.sock.sendto(pkt, ("127.0.0.1", RC_PORT))
-            time.sleep(0.02)
+            time.sleep(max(0.0, 0.02 / SPEED))
 
     def stop_stream(self):
         self.streaming = False
@@ -296,7 +350,7 @@ class FdmFeed(threading.Thread):
         self.history = []         # (t, east, north, up, ve, vn, vu, heading_deg) at ~10 Hz
         self._hist_lock = threading.Lock()
         self._hist_decim = 0
-        self.t0 = time.monotonic()
+        self.t0 = 0.0
 
     def move_east(self, metres):
         self.model.pos[0] += metres
@@ -340,19 +394,18 @@ class FdmFeed(threading.Thread):
         return max((math.hypot(s[1], s[2]) for s in self.snapshot_history() if s[0] >= after_t), default=0.0)
 
     def now_t(self):
-        return time.monotonic() - self.t0
+        return CLOCK.now() - self.t0
 
     def run(self):
-        last = time.monotonic()
         while self.running:
-            now = time.monotonic()
-            dt = min(0.1, now - last)
-            last = now
+            dt = FDM_STEP_S
+            CLOCK.advance(dt)
+            now = CLOCK.now()
             m = self.motors.motors if self.motors else [0.0] * 4
             self.model.step(dt, m)
 
             self._hist_decim += 1
-            if self._hist_decim >= 5:  # ~10 Hz of the 50 Hz loop
+            if self._hist_decim >= 10:  # ~10 Hz of the 100 Hz loop
                 self._hist_decim = 0
                 with self._hist_lock:
                     self.history.append((now - self.t0,
@@ -430,7 +483,10 @@ class FdmFeed(threading.Thread):
                 101325.0,
             )
             self.sock.sendto(pkt, ("127.0.0.1", FDM_PORT))
-            time.sleep(0.02)
+            # Real-time pacing only; simulated time already advanced by FDM_STEP_S.
+            # At high --speed this becomes a yield and the loop runs as fast as the
+            # FC can consume, which is what actually buys the speedup.
+            time.sleep(max(0.0, FDM_STEP_S / SPEED))
 
     def shutdown(self):
         self.running = False
@@ -505,6 +561,8 @@ class Sitl:
 
     def provision(self, cli_lines):
         cfg = os.path.join(self.workdir, "scenario_config.txt")
+        if DEBUG_MODE:
+            cli_lines = list(cli_lines) + [f"set debug_mode = {DEBUG_MODE}"]
         with open(cfg, "w") as f:
             f.write("\n".join(cli_lines) + "\n")
         eeprom = os.path.join(self.workdir, "eeprom.bin")
@@ -634,21 +692,22 @@ class StatusPoller(threading.Thread):
                     self.modes = [self.BOX_NAMES.get(b, f"BOX{b}") for b in sorted(modes) if b != BOX_ARM]
             except (TimeoutError, RuntimeError, OSError):
                 pass
-            time.sleep(0.2)
+            time.sleep(max(0.01, 0.2 / SPEED))
 
     def shutdown(self):
         self.running = False
 
 
 def wait_for(description, predicate, timeout=20.0, interval=0.2):
-    deadline = time.monotonic() + timeout
+    # simulated-time deadline: scenario timeouts are in sim seconds and scale with --speed
+    deadline = CLOCK.now() + timeout
     last = None
-    while time.monotonic() < deadline:
+    while CLOCK.now() < deadline:
         last = predicate()
         if last:
             log(f"ok: {description}")
             return last
-        time.sleep(interval)
+        CLOCK.sleep(interval)
     raise AssertionError(f"timeout waiting for: {description}")
 
 
@@ -697,7 +756,7 @@ def boot_and_engage(sitl, rc, fdm):
     # calibration can capture offsets from a not-yet-settled feed, and the
     # resulting bias integrates into a phantom vertical velocity.
     sitl.acc_calibrate()
-    time.sleep(2.0)
+    sim_sleep(2.0)
     wait_for("recalibration complete", lambda: sitl.status()["arming_flags"] == 0, timeout=20)
 
     rc.set(6, RC_HIGH)  # AUX3: ANGLE for the manual segment
@@ -713,10 +772,10 @@ def boot_and_engage(sitl, rc, fdm):
                 raise
             log("arm attempt latched ARM_SWITCH; cycling the switch")
             rc.set(4, 1000)
-            time.sleep(1.0)
+            sim_sleep(1.0)
 
     rc.set(2, 1600)     # raise throttle (wasThrottleRaised) and climb clear of the ground
-    time.sleep(3.0)
+    sim_sleep(3.0)
 
     rc.set(5, RC_HIGH)  # AUX2: AUTOPILOT
     required_modes = {BOX_AUTOPILOT, BOX_ALTHOLD, BOX_POSHOLD}
@@ -781,7 +840,7 @@ def scenario_mission_flight(sitl, rc, fdm):
     # point (instantaneous peaks reach ~2 m/s with SITL's 15 Hz position loop)
     samples = []
     for _ in range(10):
-        time.sleep(1.0)
+        sim_sleep(1.0)
         samples.append(math.hypot(fdm.model.vel[0], fdm.model.vel[1]))
     dist = fdm.distance_to_wp(0.0, 300.0)
     avg_speed = sum(samples) / len(samples)
@@ -807,7 +866,7 @@ def scenario_mission_yaw(sitl, rc, fdm):
         return abs(err) < 25.0
 
     wait_for("nose tracks the course (heading ~090)", on_course, timeout=30)
-    time.sleep(3.0)
+    sim_sleep(3.0)
     assert on_course(), f"heading did not hold the course: {fdm.heading_deg():.0f} deg"
 
     # SITL's starved LOW-priority scheduler runs the position controller at
@@ -910,7 +969,7 @@ def scenario_mission_land(sitl, rc, fdm):
     )
     # 5 s pre-descent loiter: shortly after arrival the vehicle must still be
     # holding altitude (an immediate 2 m/s descent would be ~4 m down by now)
-    time.sleep(2.0)
+    sim_sleep(2.0)
     assert BOX_ARM in sitl.modes(), "disarmed during the loiter"
     assert fdm.model.pos[2] > 7.0, f"descended during the loiter: alt {fdm.model.pos[2]:.1f} m"
     log(f"loitering at {fdm.model.pos[2]:.1f} m before descent")
@@ -1049,7 +1108,7 @@ def scenario_rx_loss(sitl, rc, fdm, policy):
             "failsafe active with mission continuing",
             lambda: {BOX_FAILSAFE, BOX_AUTOPILOT} <= sitl.modes(),
         )
-        time.sleep(3)
+        sim_sleep(3)
         modes = sitl.modes()
         assert {BOX_FAILSAFE, BOX_AUTOPILOT} <= modes, f"CONTINUE state did not persist: {modes}"
         log("mission still flying 3 s into failsafe")
@@ -1076,7 +1135,7 @@ def scenario_geofence(sitl, rc, fdm, action):
     if action == "RTH":
         # Plan swap, not rescue: the mission keeps flying (an injected
         # [fly home, land] plan) and the vehicle comes back inside the fence.
-        time.sleep(3)
+        sim_sleep(3)
         modes = sitl.modes()
         assert BOX_GPSRESCUE not in modes, f"rescue engaged instead of plan swap: {modes}"
         assert BOX_AUTOPILOT in modes, f"mission dropped on breach: {modes}"
@@ -1097,7 +1156,7 @@ def scenario_geofence(sitl, rc, fdm, action):
         assert dist < 10.0, f"landed {dist:.1f} m from home"
         log(f"returned and landed {dist:.1f} m from home")
     else:  # LAND
-        time.sleep(8)
+        sim_sleep(8)
         modes = sitl.modes()
         if BOX_ARM in modes:
             assert BOX_AUTOPILOT in modes, f"mission dropped instead of landing: {modes}"
@@ -1129,7 +1188,7 @@ def scenario_geofence_rth_rxloss(sitl, rc, fdm):
     log("killing RC stream mid-return")
     rc.stop_stream()
     wait_for("failsafe active", lambda: BOX_FAILSAFE in sitl.modes())
-    time.sleep(3)
+    sim_sleep(3)
     modes = sitl.modes()
     assert {BOX_FAILSAFE, BOX_AUTOPILOT} <= modes, f"return plan dropped on RX loss: {modes}"
     assert BOX_GPSRESCUE not in modes, f"unexpected rescue: {modes}"
@@ -1175,6 +1234,8 @@ RESCUE_CFG = [
     "set blackbox_device = VIRTUAL",       # .BFL artifact in the scenario dir
 ]
 
+DEBUG_MODE = None          # set from --debug-mode; appended to every scenario config
+
 
 def fly_out_and_park(sitl, rc, fdm, dist_m):
     """Mission leg out to dist_m, then hand to pilot-held ALTHOLD+POSHOLD."""
@@ -1192,7 +1253,7 @@ def fly_out_and_park(sitl, rc, fdm, dist_m):
         lambda: (lambda m: BOX_AUTOPILOT not in m and BOX_POSHOLD in m)(sitl.modes()),
         timeout=10,
     )
-    time.sleep(2.0)
+    sim_sleep(2.0)
 
 
 def rescue_engagement_asserts(sitl, variant="B"):
@@ -1274,7 +1335,7 @@ def scenario_rescue_heading(sitl, rc, fdm, variant="B"):
     fdm.start()
     wait_for("GPS fix + RX recovery (arming flags clear)", lambda: sitl.status()["arming_flags"] == 0, timeout=40)
     sitl.acc_calibrate()
-    time.sleep(2.0)
+    sim_sleep(2.0)
     wait_for("recalibration complete", lambda: sitl.status()["arming_flags"] == 0, timeout=20)
 
     rc.set(6, RC_HIGH)  # ANGLE
@@ -1287,12 +1348,12 @@ def scenario_rescue_heading(sitl, rc, fdm, variant="B"):
             if attempt == 2:
                 raise
             rc.set(4, 1000)
-            time.sleep(1.0)
+            sim_sleep(1.0)
     rc.set(2, 1600)
     rc.set(7, RC_HIGH)  # ALTHOLD + POSHOLD hover (switch must be off at arm time)
     wait_for("climbed clear of ground", lambda: fdm.model.pos[2] > 6.0, timeout=20)
     rc.set(2, 1300)
-    time.sleep(2.0)
+    sim_sleep(2.0)
 
     kill_dist = fdm.distance_from_home()
     t0 = fdm.now_t()
@@ -1603,8 +1664,49 @@ def run_scenario(name, binary, workdir, binary_b=None):
         return False
 
 
+
+def run_scenarios_parallel(names, args, jobs):
+    """Fan scenarios out across processes, each in its own network namespace.
+
+    SITL binds its UDP/TCP ports to INADDR_ANY and they are compile-time constants, so two
+    instances on one host collide. An unprivileged user+network namespace gives each run a
+    private loopback, which sidesteps that without touching the firmware. Unlike --speed this
+    changes no timing, so results are identical to a serial run.
+    """
+    import concurrent.futures
+
+    def one(name):
+        cmd = ["unshare", "-rn", "--", "bash", "-c",
+               "ip link set lo up; exec \"$@\"", "--",
+               sys.executable, os.path.abspath(__file__),
+               "--binary", os.path.abspath(args.binary),
+               "--scenario", name,
+               "--workdir", os.path.join(args.workdir, f"par_{name}"),
+               "--telemetry-port", "0",
+               "--speed", str(args.speed)]
+        if args.binary_b:
+            cmd += ["--binary-b", os.path.abspath(args.binary_b)]
+        if args.debug_mode:
+            cmd += ["--debug-mode", args.debug_mode]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        out = res.stdout + res.stderr
+        ok = f"PASS  {name}" in out or f"PASS: {name}" in out
+        skipped = f"SKIP: {name}" in out
+        for line in out.splitlines():
+            if "===" in line or "FAIL" in line:
+                log(f"[{name}] {line.replace('[harness] ', '')}")
+        return name, (None if skipped else ok)
+
+    log(f"--- running {len(names)} scenarios, {jobs} at a time, in private network namespaces")
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        for name, ok in pool.map(one, names):
+            results[name] = ok
+    return results
+
+
 def main():
-    global VERBOSE, TELEMETRY_PORT
+    global VERBOSE, TELEMETRY_PORT, SPEED, DEBUG_MODE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--binary", required=True, help="path to betaflight_SITL.elf (built with USE_FLIGHT_PLAN)")
     ap.add_argument("--binary-b", help="rescue-plan binary (-DENABLE_RESCUE_PLAN=1) for A/B scenarios")
@@ -1612,14 +1714,32 @@ def main():
     ap.add_argument("--workdir", default="/tmp/sitl_harness")
     ap.add_argument("--telemetry-port", type=int, default=TELEMETRY_PORT,
                     help="UDP port for ground-truth JSON telemetry (0 disables)")
+    ap.add_argument("--jobs", "-j", type=int, default=1,
+                    help="run scenarios in parallel, each in its own network namespace so the "
+                         "fixed SITL ports cannot collide. Unlike --speed this costs no control "
+                         "fidelity. Needs unprivileged user namespaces (unshare -rn).")
+    ap.add_argument("--debug-mode",
+                    help="set debug_mode in every scenario config, e.g. AUTOPILOT_ALTITUDE, so "
+                         "debug[0..7] land in the blackbox artifact")
+    ap.add_argument("--speed", type=float, default=1.0,
+                    help="simulated-time multiplier. SITL derives its internal time scale from "
+                         "the harness's FDM timestamps, so this speeds up the whole FC. 1.0 = real time.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     VERBOSE = args.verbose
     TELEMETRY_PORT = args.telemetry_port
+    DEBUG_MODE = args.debug_mode
+    SPEED = max(0.1, args.speed)
+    if SPEED != 1.0:
+        log(f"--- simulated time x{SPEED:g}")
 
     os.makedirs(args.workdir, exist_ok=True)
     names = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
-    results = {name: run_scenario(name, args.binary, args.workdir, args.binary_b) for name in names}
+
+    if args.jobs > 1 and len(names) > 1:
+        results = run_scenarios_parallel(names, args, max(1, args.jobs))
+    else:
+        results = {name: run_scenario(name, args.binary, args.workdir, args.binary_b) for name in names}
 
     log("--- summary")
     for name, ok in results.items():
