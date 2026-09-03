@@ -71,7 +71,8 @@ TELEMETRY_PORT = 9005  # ground-truth JSON fan-out for external visualisers, 0 d
 # All scenario waits go through this clock, so they are expressed in simulated
 # seconds and scale automatically with --speed. The step is fixed rather than
 # measured, which also makes runs far more repeatable than wall-clock stepping.
-FDM_STEP_S = 0.01          # 100Hz, strictly under SITL's 20ms simRate gate
+FDM_STEP_S = 0.01          # 100Hz nominal pacing, strictly under SITL's 20ms gate
+FDM_STEP_MAX_S = 0.0199    # at or above 20ms SITL stops updating simRate at all
 SPEED = 1.0                # wall-clock divisor, set from --speed
 
 
@@ -191,8 +192,16 @@ RATE_TAU = 0.08            # attitude response time constant, seconds
 # so the drag no longer needs to mask integrator overshoot. base_config sets
 # ap_velocity_drag_coeff to match this plant (atan(K_DRAG*v/g) over 5-7.5 m/s).
 K_DRAG = 0.8               # 1/s, linear drag: 22 deg of tilt holds ~5 m/s
-VERT_V_GAIN = 6.0          # terminal climb rate per unit thrust above hover
-VEL_TAU_V = 0.3            # vertical velocity response, seconds
+# Vertical axis. The horizontal axis is a force model (dv/dt = g*tan(tilt) - drag);
+# the vertical axis was a *velocity* source, relaxing toward
+# VERT_V_GAIN*(thrust - HOVER_THRUST) with a 0.3 s lag. That bounds sink at
+# VERT_V_GAIN*HOVER_THRUST = 1.8 m/s whatever the FC commands, so a throttle-floor
+# free-fall renders as a benign 1.8 m/s descent and a measured "descent rate" is as
+# much plant gain as controller behaviour. Model thrust as a force instead,
+# normalised so HOVER_THRUST exactly cancels gravity: zero throttle is a true -1 g.
+THRUST_TAU = 0.06          # motor/prop spin-up lag, seconds
+V_TERM_FALL = 15.0         # unpowered terminal velocity, m/s (sets the quadratic drag)
+K_DRAG_V = GRAVITY / (V_TERM_FALL ** 2)
 
 
 class MotionModel:
@@ -213,12 +222,17 @@ class MotionModel:
         self.yaw = 0.0               # rad, compass (CW from north) positive
         self.rates = [0.0, 0.0, 0.0]
         self.impact_ticks = 0
+        self.thrust = 0.0            # lagged collective
+        self.touchdown_speed = 0.0   # hardest ground contact of the run, m/s
 
     def on_ground(self):
         return self.pos[2] <= 0.001
 
     def step(self, dt, m):
-        thrust = sum(m) / 4.0
+        # First-order motor/prop lag. The velocity-source model folded this into
+        # its 0.3 s velocity lag; with a force model it belongs on the thrust.
+        self.thrust += (sum(m) / 4.0 - self.thrust) * min(1.0, dt / THRUST_TAU)
+        thrust = self.thrust
 
         if self.on_ground() and thrust < HOVER_THRUST * 0.8:
             self.pos[2] = 0.0
@@ -270,13 +284,21 @@ class MotionModel:
             self.vel[i] += acc_h[i] * dt
             self.pos[i] += self.vel[i] * dt
 
-        vt_z = VERT_V_GAIN * (thrust * math.cos(self.pitch) * math.cos(self.roll) - HOVER_THRUST)
-        new_vz = self.vel[2] + (vt_z - self.vel[2]) * min(1.0, dt / VEL_TAU_V)
-        self.accel[2] = (new_vz - self.vel[2]) / dt if dt > 0 else 0.0
-        self.vel[2] = new_vz
+        # Vertical: force model. Thrust is normalised so HOVER_THRUST cancels
+        # gravity exactly, giving a 1/HOVER_THRUST : 1 thrust-to-weight ratio and,
+        # at zero throttle, a true -1 g free-fall bounded only by drag. Tilt
+        # reduces the vertical component (the FC compensates with 1/cos(tilt); the
+        # plant must charge for it or that boost becomes a climb bias in fast
+        # forward flight).
+        tilt = math.cos(self.pitch) * math.cos(self.roll)
+        a_z = (GRAVITY * (thrust * tilt / HOVER_THRUST - 1.0)
+               - K_DRAG_V * self.vel[2] * abs(self.vel[2]))
+        self.accel[2] = a_z
+        self.vel[2] += a_z * dt
         self.pos[2] += self.vel[2] * dt
 
         if self.pos[2] < 0.0:
+            self.touchdown_speed = max(self.touchdown_speed, -self.vel[2])
             self.pos[2] = 0.0
             self.vel = [0.0, 0.0, 0.0]
             self.accel = [0.0, 0.0, 0.0]
@@ -393,12 +415,24 @@ class FdmFeed(threading.Thread):
     def max_distance_from_home(self, after_t=0.0):
         return max((math.hypot(s[1], s[2]) for s in self.snapshot_history() if s[0] >= after_t), default=0.0)
 
+    def max_sink(self, after_t=0.0):
+        """Fastest recorded descent, m/s positive down."""
+        return max((-s[6] for s in self.snapshot_history() if s[0] >= after_t), default=0.0)
+
     def now_t(self):
         return CLOCK.now() - self.t0
 
     def run(self):
+        last_wall = time.monotonic()
         while self.running:
-            dt = FDM_STEP_S
+            # Timestamp from measured wall time * SPEED rather than a fixed step.
+            # SITL infers its entire time scale from deltaSim/wallDelta, so a fixed
+            # step turns that ratio into a measurement of this thread's sleep jitter.
+            # Deriving it from the same wall delta SITL measures makes the ratio
+            # exactly SPEED, with no jitter and no drift between the two clocks.
+            wall = time.monotonic()
+            dt = min(FDM_STEP_MAX_S, max(0.0002, (wall - last_wall) * SPEED))
+            last_wall = wall
             CLOCK.advance(dt)
             now = CLOCK.now()
             m = self.motors.motors if self.motors else [0.0] * 4
@@ -774,8 +808,16 @@ def boot_and_engage(sitl, rc, fdm):
             rc.set(4, 1000)
             sim_sleep(1.0)
 
-    rc.set(2, 1600)     # raise throttle (wasThrottleRaised) and climb clear of the ground
-    sim_sleep(3.0)
+    # Closed-loop climb. Under a force plant a throttle cut does not stop the
+    # climb, it only removes the acceleration, so the craft coasts; every
+    # scenario that gates on an altitude has to be handed a settled craft, not a
+    # ballistic one. Climb, actively arrest, then hover.
+    rc.set(2, 1600)     # raise throttle (wasThrottleRaised) and break ground
+    wait_for("airborne", lambda: fdm.model.pos[2] > 2.5, timeout=20, interval=0.05)
+    rc.set(2, 1100)     # below hover: arrest the climb instead of coasting on it
+    wait_for("climb arrested", lambda: fdm.model.vel[2] < 0.5, timeout=20, interval=0.05)
+    rc.set(2, 1300)     # ~hover collective; alt hold takes the altitude from here
+    sim_sleep(1.0)
 
     rc.set(5, RC_HIGH)  # AUX2: AUTOPILOT
     required_modes = {BOX_AUTOPILOT, BOX_ALTHOLD, BOX_POSHOLD}
@@ -1631,6 +1673,21 @@ def run_leg(name, variant, body, extra_cfg, opts, binary, leg_dir):
             return body(sitl, rc, fdm)
         return body(sitl, rc, fdm, variant)
     finally:
+        if fdm is not None:
+            # Vertical outcome of every run, reported but not asserted. With a
+            # force-model plant these are unbounded, so they are the direct
+            # measure of a throttle-floor descent; under the old velocity-source
+            # plant both were pinned near 1.18 m/s no matter what the FC did.
+            log(f"plant: peak sink {fdm.max_sink():.2f} m/s, "
+                f"hardest touchdown {fdm.model.touchdown_speed:.2f} m/s, "
+                f"max alt {fdm.max_altitude():.1f} m")
+            try:
+                with open(os.path.join(leg_dir, "traj.csv"), "w") as tf:
+                    tf.write("t,east,north,up,ve,vn,vu,heading\n")
+                    for sample in fdm.snapshot_history():
+                        tf.write(",".join(f"{v:.3f}" for v in sample) + "\n")
+            except OSError:
+                pass  # diagnostics only; never fail a scenario on this
         for feed in (rc, fdm, motors, poller):
             if feed is not None:
                 feed.shutdown()
