@@ -765,6 +765,25 @@ WP_NORTH60_LAT = HOME_LAT + 60.0 / M_PER_DEG
 WP_CORNER_LAT = HOME_LAT + 25.0 / M_PER_DEG
 WP_CORNER_LON = HOME_LON + 42.0 / (M_PER_DEG * math.cos(math.radians(HOME_LAT)))
 
+# --- landing horizontal-gain scenario --------------------------------------
+# Existing LAND scenarios (mission_land, rx_land, geofence_land) either brake
+# to a small residual before the descent starts, or land at the *current*
+# position (zero horizontal error by construction), so none of them exercise
+# a meaningful horizontal error during the descent. This waypoint pair
+# deliberately engineers one: settle in a HOLD, then dispatch a LAND target
+# offset ~1.5 m sideways from that settled point. Because the offset is
+# inside the default 2 m hold radius and the craft is nearly stationary, the
+# executor's arrival gate (positionNavUpdate's withinAcceptanceRadius check,
+# any-speed completion) is satisfied on the very first tick of the LAND leg,
+# so the descent begins from a clean, deliberate ~1.5 m horizontal step
+# rather than whatever an approach happens to brake down to.
+LAND_OFFSET_HOLD_DIST_M = 20.0   # metres north of home for the settle point
+LAND_OFFSET_M = 0.3              # metres east: calibration run
+LAND_OFFSET_HOLD_DURATION_DS = 100   # calibration: longer settle
+LAND_OFFSET_HOLD_DURATION_S = LAND_OFFSET_HOLD_DURATION_DS / 10.0
+LAND_OFFSET_HOLD_LAT = HOME_LAT + LAND_OFFSET_HOLD_DIST_M / M_PER_DEG
+LAND_OFFSET_LAND_LON = HOME_LON + LAND_OFFSET_M / (M_PER_DEG * math.cos(math.radians(HOME_LAT)))
+
 
 def base_config(extra):
     return [
@@ -1033,6 +1052,183 @@ def scenario_mission_land(sitl, rc, fdm):
     dist = fdm.distance_to_wp(25.0, 40.0)
     assert dist < 10.0, f"landed {dist:.1f} m from the LAND waypoint"
     log(f"landed {dist:.1f} m from the LAND waypoint")
+
+
+LAND_OFFSET_ONSET_BACKOFF_S = 0.5   # window starts this far before the detected onset
+
+
+def horizontal_descent_metrics(fdm, t_onset, land_east_m, land_north_m):
+    """Analyse horizontal position/velocity from the LAND horizontal step to
+    ground contact, testing the landing-gain hypothesis: that the decoupled
+    horizontal budget raises the effective position gain enough to under-damp
+    the approach and swing around the target.
+
+    The window opens LAND_OFFSET_ONSET_BACKOFF_S before t_onset because the
+    onset is detected from the craft's *response*, which necessarily lags the
+    command step by the position-loop and plant lag; backing off keeps the
+    step itself inside the window.
+
+    Returns None if too few samples were recorded. Otherwise:
+      reversals         - sign changes of the velocity component along the
+                          fixed axis from the craft's position at window open
+                          toward the LAND target. This is the oscillation
+                          metric: 0 means a single monotonic closing move,
+                          >= 1 means the craft reversed direction along the
+                          error axis at least once
+      reversal_ivl_mean/std - mean and standard deviation of the interval
+                          between successive reversals (s). A coherent limit
+                          cycle has std << mean; irregular noise-driven
+                          dither has std comparable to or larger than mean.
+                          Both None with fewer than 3 reversals.
+      peak_hspeed       - peak horizontal ground speed in the window (m/s)
+      herr_touchdown    - horizontal distance from the LAND target at first
+                          ground contact (m)
+      hspeed_touchdown  - horizontal ground speed at first ground contact (m/s)
+      entry_err         - largest horizontal error in the first second of the
+                          window, i.e. the size of the commanded step (m)
+      settle_err        - horizontal error averaged over the last 1.5 s before
+                          contact (m): where the loop actually converged
+      hspeed_std_early/late - standard deviation of horizontal speed over the
+                          first and last thirds of the descent. Decaying
+                          (late << early) is a damped approach; sustained or
+                          growing is the oscillation the hypothesis predicts
+      touchdown_found   - whether ground contact was seen in the window
+      duration          - length of the analysed window (s)
+      n_samples         - sample count in the window (~10 Hz)
+    """
+    t_start = max(0.0, t_onset - LAND_OFFSET_ONSET_BACKOFF_S)
+    samples = [s for s in fdm.snapshot_history() if s[0] >= t_start]
+    if len(samples) < 5:
+        return None
+
+    # Fixed radial axis: from the craft's position at window open toward the
+    # (horizontally static) LAND point. Positive velocity along it is closing
+    # on the target, negative is moving away - the axis the horizontal control
+    # law is actually driving, not an arbitrary east/north split.
+    e0, n0 = samples[0][1], samples[0][2]
+    axis_e, axis_n = land_east_m - e0, land_north_m - n0
+    norm = math.hypot(axis_e, axis_n)
+    if norm > 0.01:
+        axis_e, axis_n = axis_e / norm, axis_n / norm
+    else:
+        axis_e, axis_n = 1.0, 0.0  # degenerate: already on target, axis choice is moot
+
+    times, vr_series, hspeed_series, herr_series = [], [], [], []
+    touchdown_idx = None
+    for i, s in enumerate(samples):
+        t, e, n, up, ve, vn, _vu, _hdg = s
+        times.append(t)
+        vr_series.append(ve * axis_e + vn * axis_n)
+        hspeed_series.append(math.hypot(ve, vn))
+        herr_series.append(math.hypot(land_east_m - e, land_north_m - n))
+        if touchdown_idx is None and i > 0 and up <= 0.02:
+            touchdown_idx = i
+
+    end = touchdown_idx if touchdown_idx is not None else len(samples) - 1
+    if end < 4:
+        return None
+
+    # Zero crossings of the along-axis velocity, with a deadband so estimator
+    # and loop-rate noise near zero is not counted as a reversal.
+    DEADBAND_MPS = 0.05
+    reversal_times = []
+    last_sign = 0
+    for t, vr in zip(times[: end + 1], vr_series[: end + 1]):
+        sign = 1 if vr > DEADBAND_MPS else (-1 if vr < -DEADBAND_MPS else 0)
+        if sign == 0:
+            continue
+        if last_sign != 0 and sign != last_sign:
+            reversal_times.append(t)
+        last_sign = sign
+
+    ivl_mean = ivl_std = None
+    if len(reversal_times) >= 3:
+        ivls = [b - a for a, b in zip(reversal_times, reversal_times[1:])]
+        ivl_mean = sum(ivls) / len(ivls)
+        ivl_std = math.sqrt(sum((x - ivl_mean) ** 2 for x in ivls) / len(ivls))
+
+    def stdev(xs):
+        if len(xs) < 2:
+            return 0.0
+        mu = sum(xs) / len(xs)
+        return math.sqrt(sum((x - mu) ** 2 for x in xs) / len(xs))
+
+    third = max(2, (end + 1) // 3)
+    t_end = times[end]
+    settle_window = [h for t, h in zip(times[: end + 1], herr_series[: end + 1]) if t >= t_end - 1.5]
+    entry_window = [h for t, h in zip(times[: end + 1], herr_series[: end + 1]) if t <= times[0] + 1.0]
+
+    return {
+        "reversals": len(reversal_times),
+        "reversal_ivl_mean": ivl_mean,
+        "reversal_ivl_std": ivl_std,
+        "peak_hspeed": max(hspeed_series[: end + 1], default=0.0),
+        "herr_touchdown": herr_series[end],
+        "hspeed_touchdown": hspeed_series[end],
+        "entry_err": max(entry_window, default=herr_series[0]),
+        "settle_err": (sum(settle_window) / len(settle_window)) if settle_window else herr_series[end],
+        "hspeed_std_early": stdev(hspeed_series[:third]),
+        "hspeed_std_late": stdev(hspeed_series[end + 1 - third : end + 1]),
+        "touchdown_found": touchdown_idx is not None,
+        "duration": t_end - times[0],
+        "n_samples": end + 1,
+    }
+
+
+def scenario_mission_land_offset(sitl, rc, fdm):
+    """LAND engaged with a deliberate ~1.5 m horizontal offset (landing-gain
+    investigation): settle in a HOLD, then dispatch a LAND target offset from
+    that settled point but still inside the LAND arrival gate, so the descent
+    begins immediately from a clean horizontal step rather than from whatever
+    residual an approach happens to brake down to.
+
+    Records horizontal position and velocity throughout the descent and
+    reports the oscillation / peak / touchdown metrics. Deliberately does NOT
+    assert on them: they are the quantity under measurement and are noisy run
+    to run, so the pass/fail assertions here cover only that the manoeuvre
+    actually happened (offset engaged, descended, landed)."""
+    boot_and_engage(sitl, rc, fdm)
+
+    # Detecting the LAND offset step from the craft's own motion is unreliable:
+    # the outbound leg to the hold point and the hold's own altitude-settle
+    # wobble both already exceed small velocity thresholds, so a
+    # velocity-threshold detector fires early (verified against a real run).
+    # Instead, mark the hold's own arrival-gate crossing (any-speed, horizontal
+    # radius only - see positionNavUpdate's withinAcceptanceRadius check) and
+    # schedule the LAND dispatch from the fixed HOLD duration in the mission,
+    # which runs off the same simulated clock the harness itself advances.
+    wait_for(
+        "vehicle crosses the hold arrival radius",
+        lambda: fdm.distance_to_wp(0.0, LAND_OFFSET_HOLD_DIST_M) < 2.0,
+        timeout=60,
+        interval=0.05,
+    )
+    hold_dist = fdm.distance_to_wp(0.0, LAND_OFFSET_HOLD_DIST_M)
+    hold_speed = math.hypot(fdm.model.vel[0], fdm.model.vel[1])
+    log(f"hold arrival gate crossed: {hold_dist:.2f} m, {hold_speed:.2f} m/s "
+        f"(not yet settled - the {LAND_OFFSET_HOLD_DURATION_S:.1f} s hold duration below is what settles it)")
+
+    sim_sleep(LAND_OFFSET_HOLD_DURATION_S + 0.4)   # + margin over the scheduler/poll slack
+    t_onset = fdm.now_t()
+
+    land_east_m, land_north_m = LAND_OFFSET_M, LAND_OFFSET_HOLD_DIST_M
+    entry_err_now = fdm.distance_to_wp(land_east_m, land_north_m)
+    log(f"LAND dispatch scheduled at t={t_onset:.1f} s: horizontal error {entry_err_now:.2f} m, "
+        f"speed {math.hypot(fdm.model.vel[0], fdm.model.vel[1]):.2f} m/s")
+
+    wait_for("touchdown disarms", lambda: BOX_ARM not in sitl.modes(), timeout=90, interval=0.5)
+    assert fdm.model.on_ground(), f"disarmed in the air: alt {fdm.model.pos[2]:.1f} m"
+
+    m = horizontal_descent_metrics(fdm, t_onset, land_east_m, land_north_m)
+    assert m is not None, "no usable descent samples recorded"
+    assert m["entry_err"] > 0.5 * LAND_OFFSET_M, (
+        f"the offset step never materialised: entry error only {m['entry_err']:.2f} m "
+        f"(expected ~{LAND_OFFSET_M:.1f} m)")
+    m["hold_dist_at_gate"] = hold_dist
+    m["touchdown_speed"] = fdm.model.touchdown_speed
+    log("[metrics] " + json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
+                                   for k, v in m.items()}))
+    return m
 
 
 def scenario_mission_takeoff(sitl, rc, fdm):
@@ -1561,6 +1757,35 @@ SCENARIOS = {
             "set ap_waypoint_hold_radius = 400",
             "set ap_landing_descent_rate = 200",  # keep the descent short
             "set landing_disarm_threshold = 10",   # jerk-based touchdown disarm
+        ],
+    ),
+    # Landing-gain investigation. Not a pass/fail regression test: it prints
+    # metrics for an A/B across firmware builds (see horizontal_descent_metrics).
+    # The existing LAND scenarios all begin their descent with essentially zero
+    # horizontal error, so none of them can show a horizontal-loop effect.
+    "mission_land_offset": (
+        scenario_mission_land_offset,
+        [
+            "set ap_yaw_mode = FIXED",   # isolate translation: no yaw coupling in the metric
+            # HOLD at 20 m north to settle, then LAND 1.5 m east of that point.
+            f"waypoint update 0 {LAND_OFFSET_HOLD_LAT:.7f} {HOME_LON:.7f} {int((HOME_ALT_M + 10) * 100)} 300 hold {LAND_OFFSET_HOLD_DURATION_DS} none",
+            f"waypoint insert 1 {LAND_OFFSET_HOLD_LAT:.7f} {LAND_OFFSET_LAND_LON:.7f} {int((HOME_ALT_M + 10) * 100)} 300 land 0 none",
+            # Default 2 m hold radius: the 1.5 m offset must sit INSIDE the LAND
+            # arrival gate so the descent starts on the first tick of the leg.
+            # (Other landing scenarios widen this to 4 m for determinism; here
+            # the gate width is part of what is being tested.)
+            "set ap_waypoint_hold_radius = 200",
+            # 1 m/s from ~10 m: ~10 s of descent, long enough for a horizontal
+            # oscillation at the expected ~0.3-1 rad/s to show several cycles.
+            # A 2 m/s descent (as mission_land uses) is over too fast to tell.
+            "set ap_landing_descent_rate = 100",
+            "set landing_disarm_threshold = 10",   # jerk-based touchdown disarm
+            # DEBUG_AUTOPILOT_PID rides in the blackbox artifact: debug[2] is
+            # pidP*10 and debug[6] pidF*10 on the earth-frame EAST axis (the
+            # offset axis), which is the F:P gain ratio the theory predicts.
+            "feature BLACKBOX",
+            "set blackbox_device = VIRTUAL",
+            "set blackbox_sample_rate = 1/1",
         ],
     ),
     "mission_takeoff": (
